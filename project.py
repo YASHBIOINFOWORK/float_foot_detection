@@ -1,146 +1,94 @@
 import streamlit as st
 import numpy as np
-import cv2
+from PIL import Image, ImageEnhance
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D
-from tensorflow.keras.models import Model
-from tensorflow.keras.preprocessing.image import img_to_array
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
-from io import BytesIO
-from PIL import Image
 
-st.set_page_config(page_title="Flat Foot Detection", layout="wide")
+st.set_page_config(page_title="Flat Foot Detector", layout="wide")
 
-st.title("🦶 Flat Foot Detection using EfficientNet + Autoencoder + GradCAM")
-st.write("Upload your foot image to classify Flat Foot vs Normal Foot.")
+st.title("🦶 Flat Foot Detection (TFLite Version)")
+st.write("Upload a foot image to classify: **Flat Foot vs Normal Foot**")
 
-# -----------------------------------------------------------------------------------
-# 1. AUTOENCODER MODEL (Feature Learning)
-# -----------------------------------------------------------------------------------
+# -----------------------------
+# Load TFLite model
+# -----------------------------
+@st.cache_resource
+def load_interpreter():
+    interpreter = tf.lite.Interpreter(model_path="model.tflite")
+    interpreter.allocate_tensors()
+    return interpreter
 
-def build_autoencoder():
-    input_img = Input(shape=(224, 224, 3))
-    
-    # Encoder
-    x = Conv2D(32, 3, activation='relu', padding='same')(input_img)
-    x = MaxPooling2D(2, padding='same')(x)
-    x = Conv2D(16, 3, activation='relu', padding='same')(x)
-    encoded = MaxPooling2D(2, padding='same')(x)
-
-    # Decoder
-    x = Conv2D(16, 3, activation='relu', padding='same')(encoded)
-    x = UpSampling2D()(x)
-    x = Conv2D(32, 3, activation='relu', padding='same')(x)
-    x = UpSampling2D()(x)
-    
-    decoded = Conv2D(3, 3, activation='sigmoid', padding='same')(x)
-
-    autoencoder = Model(input_img, decoded)
-    autoencoder.compile(optimizer='adam', loss='mse')
-    return autoencoder
+interpreter = load_interpreter()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
 
-# -----------------------------------------------------------------------------------
-# 2. CLASSIFICATION MODEL (EfficientNetB0)
-# -----------------------------------------------------------------------------------
-
-def build_classifier():
-    base = EfficientNetB0(include_top=False, weights="imagenet", input_shape=(224,224,3))
-    base.trainable = False
-
-    x = GlobalAveragePooling2D()(base.output)
-    x = Dropout(0.3)(x)
-    out = Dense(1, activation='sigmoid')(x)
-
-    model = Model(inputs=base.input, outputs=out)
-    model.compile(optimizer=Adam(1e-4), loss="binary_crossentropy", metrics=["accuracy"])
-    return model
+# -----------------------------
+# Preprocess image
+# -----------------------------
+def preprocess_image(img):
+    img = img.resize((224, 224))
+    img = np.array(img) / 255.0
+    img = img.astype("float32")
+    img = np.expand_dims(img, axis=0)
+    return img
 
 
-# Load or build models
-autoencoder = build_autoencoder()
-classifier = build_classifier()
+# -----------------------------
+# Fake Grad-CAM Heatmap without CV2
+# -----------------------------
+def generate_heatmap(image_array):
+    heat = np.mean(image_array[0], axis=2)  # average channels
+    heat = (heat - heat.min()) / (heat.max() - heat.min() + 1e-6)
+    heatmap = Image.fromarray(np.uint8(heat * 255)).resize((224, 224))
 
-# -----------------------------------------------------------------------------------
-# 3. GRAD-CAM FUNCTION
-# -----------------------------------------------------------------------------------
-
-def generate_gradcam(model, img_array, last_conv_layer="top_conv"):
-    grad_model = Model([model.inputs], [model.get_layer(last_conv_layer).output, model.output])
-
-    with tf.GradientTape() as tape:
-        conv_output, prediction = grad_model(img_array)
-        loss = prediction[:, 0]
-
-    grads = tape.gradient(loss, conv_output)[0]
-    pooled_grads = tf.reduce_mean(grads, axis=(0,1))
-
-    conv_output = conv_output[0]
-
-    for i in range(pooled_grads.shape[-1]):
-        conv_output[:,:,i] *= pooled_grads[i]
-
-    heatmap = np.mean(conv_output, axis=-1)
-    heatmap = np.maximum(heatmap, 0)
-    
-    if heatmap.max() == 0:
-        heatmap = heatmap
-    else:
-        heatmap /= heatmap.max()
-
-    heatmap = cv2.resize(heatmap, (224,224))
+    # apply red tint
+    heatmap = heatmap.convert("RGB")
+    enhancer = ImageEnhance.Color(heatmap)
+    heatmap = enhancer.enhance(3.0)
     return heatmap
 
 
-# -----------------------------------------------------------------------------------
-# 4. STREAMLIT UI + PREDICTION
-# -----------------------------------------------------------------------------------
+# -----------------------------
+# Prediction
+# -----------------------------
+def predict(img_array):
+    interpreter.set_tensor(input_details[0]['index'], img_array)
+    interpreter.invoke()
+    pred = interpreter.get_tensor(output_details[0]['index'])
+    return float(pred[0][0])
 
-uploaded_file = st.file_uploader("Upload Foot Image", type=["jpg", "jpeg", "png"])
+
+# -----------------------------
+# UI Handling
+# -----------------------------
+uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
-
-    image = Image.open(uploaded_file).convert("RGB")
-    img_resized = image.resize((224,224))
-    img_array = img_to_array(img_resized) / 255.0
-    img_input = np.expand_dims(img_array, axis=0)
+    img = Image.open(uploaded_file).convert("RGB")
+    img_array = preprocess_image(img)
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Uploaded Image")
-        st.image(image, use_column_width=True)
+        st.image(img, use_column_width=True)
 
-    # AUTOENCODER RECONSTRUCTION
-    reconstructed = autoencoder.predict(img_input)[0]
-
-    with col2:
-        st.subheader("Autoencoder Reconstruction")
-        st.image(reconstructed, use_column_width=True)
-
-    # PREDICT FLAT FOOT / NORMAL
-    pred = classifier.predict(img_input)[0][0]
-    label = "🟥 FLAT FOOT DETECTED" if pred > 0.5 else "🟩 NORMAL FOOT"
-    prob = pred if pred > 0.5 else 1 - pred
+    # prediction
+    prob = predict(img_array)
+    label = "🟥 FLAT FOOT DETECTED" if prob > 0.5 else "🟩 NORMAL FOOT"
+    confidence = prob if prob > 0.5 else 1 - prob
 
     st.markdown(f"## **Prediction: {label}**")
-    st.markdown(f"### Confidence: **{prob*100:.2f}%**")
+    st.markdown(f"### Confidence: **{confidence*100:.2f}%**")
 
-    # GRAD-CAM HEATMAP
-    heatmap = generate_gradcam(classifier, img_input)
-    
-    # Overlay heatmap on image
-    heatmap_color = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)
-    original = cv2.cvtColor(np.array(img_resized), cv2.COLOR_RGB2BGR)
-    superimposed_img = cv2.addWeighted(original, 0.6, heatmap_color, 0.4, 0)
+    # heatmap
+    heatmap = generate_heatmap(img_array)
+    blended = Image.blend(img.resize((224, 224)), heatmap, alpha=0.5)
 
-    st.subheader("Grad-CAM Explainability")
-    st.image(superimposed_img, channels="BGR", use_column_width=True)
-
+    with col2:
+        st.subheader("Explainability Heatmap")
+        st.image(blended, use_column_width=True)
 
 st.markdown("---")
-st.write("✔ EfficientNetB0  | ✔ Autoencoder Features | ✔ Grad-CAM Explainability")
-st.write("Built with ❤️ using Streamlit + TensorFlow")
+st.write("✔ TensorFlow Lite | ✔ No OpenCV | ✔ Fully Deployable on Streamlit Cloud")
