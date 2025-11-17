@@ -1,6 +1,4 @@
 streamlit
 numpy
-opencv-python-headless
-matplotlib
-Pillow
-tensorflow-cpu @ https://github.com/Kshitij-Tajane/tensorflow-builder/releases/download/v2.16.2/tensorflow-2.16.2-cp313-cp313-manylinux2014_x86_64.whl
+pillow
+tensorflow-cpu==2.14.0
